@@ -7,39 +7,29 @@ import asyncssh
 import sqlite3
 import re
 import sys
+import traceback
 
 from state_machines import IPMrouteParser
 
-class IPMrouteClientSession(asyncssh.SSHClientSession):
-    
-    def __init__(self):
+class ClientSessionBase(asyncssh.SSHClientSession):
+
+    def __init__(self, db):
         """Initialise the session.
 
         We need an additional member variable of a string buffer over and above the base class.
         """
         super().__init__()  # Not sure how much this is necessary... but for completeness it should be there methinks.
         self.buffer: str = ""
-        self.mroute_parser_state: IPMrouteParser = IPMrouteParser.DEFAULT
-        self.db = sqlite3.connect(":memory:")  # I actually think that this db should be in some kind of parent class.
-        # Create appropriate tables.
-        # scratchpad vars for the state machine to use
-        self.mcast_group = ""
-        with self.db:
-            cur = self.db.cursor()
-            cur.execute("""CREATE TABLE ports (
-                name text PRIMARY KEY,
-                remote text
-            );
-            """)
-            cur.execute("""CREATE TABLE subscriptions (
-                ID INTEGER PRIMARY KEY,
-                mcast_group text,
-                port text,
-                FOREIGN KEY (port)
-                    REFERENCES ports(name)
-            );
-            """)
-        
+        self.db = db # sqlite3.connect(":memory:")
+
+    def __call__(self):
+        return self
+
+    def process_line(self, line: str):
+        """Process the line held in the buffer.
+
+        The specifics of this function need to be implemented in the derived class."""
+        raise NotImplementedError
     
     def data_received(self, data, datatype):
         """Process data received via the SSH session.
@@ -48,26 +38,48 @@ class IPMrouteClientSession(asyncssh.SSHClientSession):
         detected, we trigger some processing to happen on the line that is in the buffer, and reset it to receive the
         next incoming line.
         """
+        #print(repr(data))
         if "\x1b" in data:
             # It's some sort of vty100 control sequence, we aren't interested.
             return
-        #print(f"Data received: {repr(data)}")
         while "\r\n" in data:
             self.buffer += data[:data.find("\r\n")]
             self.process_line(self.buffer)
             self.buffer = ""
             data = data[data.find("\r\n")+2:]
-        #TODO should handle an \r better, otherwise the prompts cause weirdness.
 
         if ">" in data:
             self.buffer = ""
         else:
             self.buffer += data
-        #TODO still need to figure out how to handle when we get a prompt (> character). It doesn't get a newline then.
 
     def connection_lost(self, exc):
         if exc:
-            print('SSH session error: ' + str(exc), file=sys.stderr)
+            print(f'SSH session error: ({type(exc)}) {str(exc)}', file=sys.stderr)
+            print()
+
+
+class IPMrouteClientSession(ClientSessionBase):
+    
+    def __init__(self, db):
+        """Set up the appropriate table in the db."""
+        super().__init__(db)
+        # We need a state machine to parse the output of `show ip mroute`:
+        self.mroute_parser_state: IPMrouteParser = IPMrouteParser.DEFAULT
+
+        # scratchpad vars for the state machine to use
+        self.mcast_group = ""
+
+        # Set up the appropriate table in the database:
+        #print(self.db)
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute("""CREATE TABLE subscriptions (
+                ID INTEGER PRIMARY KEY,
+                mcast_group text,
+                port text
+            );
+            """)
 
     def process_line(self, line):
         """Process the line held in the buffer.
@@ -109,6 +121,7 @@ class IPMrouteClientSession(asyncssh.SSHClientSession):
             if len(line) > 0 and "\r" not in line:
                 # Now we start to see which ports are interested.
                 port = line.split(',')[0]  # TODO: should probably introduce logic to ignore the loopback interfaces. Or should I?
+                #print(self.db)
                 with self.db:
                     cur = self.db.cursor()
                     cur.execute("""INSERT INTO subscriptions (mcast_group, port) VALUES (?, ?)""", (self.mcast_group, port.strip()))
@@ -122,3 +135,52 @@ class IPMrouteClientSession(asyncssh.SSHClientSession):
             # Something has gone wrong. 
             print("Something has gone quite wrong.")
 
+
+
+class VersionClientSession(ClientSessionBase):
+    """This actually should be removed. It's just reminding me to handle the lldp remotes at this point."""
+    def data_received(self, data, datatype):
+        print(data, end="")
+
+
+class LLDPRemoteSession(ClientSessionBase):
+
+    def __init__(self, db):
+        super().__init__(db)
+
+        # Scratchpad variables:
+        self.port_name = ""
+        self.requested_port = 0
+
+        with self.db:
+            cur = self.db.cursor()
+            cur.execute("""CREATE TABLE lldp_remotes (
+                ID INTEGER PRIMARY KEY,
+                port_name text,
+                remote_host text
+            );
+            """)
+
+
+    def process_line(self, line):
+        """Process the line held in the buffer.
+
+        This is a fairly simple one, we ignore most of the output of the command, we are just looking for the remote host.
+        No state machine needed as such.
+        """
+        port_name_re = re.compile(r"show lldp interfaces ethernet 1/\d{1,2}")  # We can't just use `if Eth in line` here because if we are connecting to a switch, it gets confused.
+        remote_host = None
+        
+        if port_name_re.search(line) is not None:
+            self.port_name = f"Eth1/{port_name_re.findall(line)[0][32:]}" 
+            #print(f"Processing remote host on port {self.port_name}")
+        #elif "No lldp remote information." in line:  # Can remove the comments if we explicitly need the non-blank ones. We might not.
+        #    remote_host = "None"
+        elif "Remote system name" in line:
+            remote_host = line[20:].strip()
+            
+        if remote_host is not None:
+            with self.db:
+                cur = self.db.cursor()
+                cur.execute("""INSERT INTO lldp_remotes (port_name, remote_host) VALUES (?,?)""",  (self.port_name, remote_host))
+            remote_host = None
