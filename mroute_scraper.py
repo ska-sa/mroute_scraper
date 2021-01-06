@@ -4,8 +4,13 @@ import asyncssh
 import sys
 import re
 import sqlite3
+import socket # for inet_aton
+import struct # for unpack
 
 from optparse import OptionParser
+from configparser import ConfigParser
+
+from typing import List
 
 from client_sessions import IPMrouteClientSession, LLDPRemoteSession, VersionClientSession
 
@@ -63,7 +68,7 @@ async def scrape_mroutes(conn: asyncssh.SSHClientConnection, db):
                     print(f"\t\t{group_name[0]}")
 
 
-async def run_client(host: str):
+async def run_client(host: str, configs: List[str]):
     """Run the ssh client.
 
     We create (currently) two concurrent sessions, one to scrape the mroutes, the other is basically a placeholder
@@ -71,6 +76,28 @@ async def run_client(host: str):
     """
 
     central_db = sqlite3.connect(":memory:")
+
+    if configs is not None:
+        with central_db:
+            cur = central_db.cursor()
+            cur.execute("""CREATE TABLE maddr_names (
+                maddr text PRIMARY KEY,
+                name text
+            );
+            """)
+            for filepath in configs:
+                config = ConfigParser()
+                config.read(filepath)
+                # Behold my python kung-fu, and marvel...
+                for mcast_ip, name in zip(config["fengine"]["source_mcast_ips"].split(","), config["fengine"]["source_names"].split(",")):
+                    base_ip, ip_range, _port = re.split(r"[\+\:]", mcast_ip)
+                    base_ip = struct.unpack("!L", socket.inet_aton(base_ip))
+                    for i in range(int(ip_range) + 1):  # we need the plus one because the range is specified as <addr>+<n> in the config file, i.e. there are n+1 addresses. 
+                        final_ip = socket.inet_ntoa(struct.pack("!L", base_ip[0] + i))
+                        cur.execute("""INSERT OR IGNORE INTO maddr_names(maddr, name) VALUES (?, ?);""", (final_ip, f"{name}.{i}"))
+    else:
+        print("No config file(s) specified, we can still look at the mroutes but we can't say what they are for.")
+
     async with asyncssh.connect(host=host, username="monitor", password="monitor") as conn:
         # Creating the task first, then awaiting it, allows multiple tasks to run concurrently, as opposed to
         # completely finishing the first one, then only starting with the next.
@@ -107,11 +134,13 @@ if __name__ == "__main__":
                   """
     parser = OptionParser(description=description)
     parser.set_usage("%prog [options]")
-    parser.add_option("-a", "--addr", dest="addr", type=str, default="10.8.96.57",
+    parser.add_option("-a", "--addr", type=str, default="10.8.96.57",
                       help="Hostname or ip address of Mlnx switch to contact.")
+    parser.add_option("-c", "--config", action="append", type=str, default=None,
+                      help="Path of config file to parse, to determine purposes of mcast traffic. Multiple files can be parsed by repeating the flag.")
     opts, _args = parser.parse_args()
 
     try:
-        asyncio.get_event_loop().run_until_complete(run_client(host=opts.addr))
+        asyncio.get_event_loop().run_until_complete(run_client(host=opts.addr, configs=opts.config))
     except (OSError, asyncssh.Error) as exc:
         sys.exit('SSH connection failed: ' + str(exc)) 
