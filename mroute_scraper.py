@@ -44,7 +44,7 @@ async def scrape_lldp_remotes(conn: asyncssh.SSHClientConnection, db):
 
 async def scrape_mroutes(conn: asyncssh.SSHClientConnection, db):
     """Ask the switch which mroutes it knows, then parse the output and print it.
-    
+
     I still need to decide whether this functionality really belongs in a separate class, perhaps in the client_sessions.py file.
     """
     chan, session = await conn.create_session(IPMrouteClientSession(db),  term_type="vt100", term_size=(80,10000000))  # We need a bajillion lines, to prevent the switch from doing a `more` kind of thing and getting the program stuck.
@@ -55,10 +55,10 @@ async def scrape_mroutes(conn: asyncssh.SSHClientConnection, db):
     if False:
         with session.db:
             cur = session.db.cursor()
-            
+
             # I force it to make a list instead of an iterator / generator. Not sure if this is the most efficient way to do things.
             port_names = list(cur.execute("""SELECT DISTINCT port FROM subscriptions;"""))
-            
+
             for port_name in port_names:
                 #print(f"{port_name[0]}")
                 group_count = cur.execute("""SELECT COUNT(mcast_group) FROM subscriptions WHERE port=?;""", (port_name[0],))
@@ -92,7 +92,7 @@ async def run_client(host: str, configs: List[str]):
                 for mcast_ip, name in zip(config["fengine"]["source_mcast_ips"].split(","), config["fengine"]["source_names"].split(",")):
                     base_ip, ip_range, _port = re.split(r"[\+\:]", mcast_ip)
                     base_ip = struct.unpack("!L", socket.inet_aton(base_ip))
-                    for i in range(int(ip_range) + 1):  # we need the plus one because the range is specified as <addr>+<n> in the config file, i.e. there are n+1 addresses. 
+                    for i in range(int(ip_range) + 1):  # we need the plus one because the range is specified as <addr>+<n> in the config file, i.e. there are n+1 addresses.
                         final_ip = socket.inet_ntoa(struct.pack("!L", base_ip[0] + i))
                         cur.execute("""INSERT OR IGNORE INTO maddr_names(maddr, name) VALUES (?, ?);""", (final_ip, f"{name}.{i}"))
     else:
@@ -103,16 +103,16 @@ async def run_client(host: str, configs: List[str]):
         # completely finishing the first one, then only starting with the next.
         mroute_task = asyncio.create_task(scrape_mroutes(conn, central_db))
         lldp_remote_task = asyncio.create_task(scrape_lldp_remotes(conn, central_db))
-        
+
         await lldp_remote_task
         await mroute_task
 
         with central_db:
             cur = central_db.cursor()
-            
+
             # I force it to make a list instead of an iterator / generator. Not sure if this is the most efficient way to do things.
             port_names = list(cur.execute("""SELECT DISTINCT port FROM subscriptions;"""))
-            
+
             for port_name in port_names:
                 #print(f"{port_name[0]}")
                 group_count = list(cur.execute("""SELECT COUNT(mcast_group) FROM subscriptions WHERE port=?;""", (port_name[0],)))
@@ -125,11 +125,11 @@ async def run_client(host: str, configs: List[str]):
                 for group_name in cur.execute("""SELECT mcast_group FROM subscriptions WHERE port=?;""", (port_name[0],)):
                     print(f"\t\t{group_name[0]}")
 
-                
+
 
 if __name__ == "__main__":
 
-    description = """This program connects to Mellanox switches via SSH and queries the mroutes known to the swith.
+    description = """This program connects to Mellanox switches via SSH and queries the mroutes known to the switch.
                      It then prints a summary of the multicast groups going out on each poirt.
                   """
     parser = OptionParser(description=description)
@@ -143,4 +143,4 @@ if __name__ == "__main__":
     try:
         asyncio.get_event_loop().run_until_complete(run_client(host=opts.addr, configs=opts.config))
     except (OSError, asyncssh.Error) as exc:
-        sys.exit('SSH connection failed: ' + str(exc)) 
+        sys.exit('SSH connection failed: ' + str(exc))
